@@ -4,6 +4,7 @@ No cookies required. Uses multi-client yt-dlp extraction.
 """
 
 import os
+import re
 import asyncio
 import logging
 import random
@@ -46,13 +47,12 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 FFMPEG_BEFORE = (
     "-reconnect 1 -reconnect_streamed 1 "
-    "-reconnect_delay_max 5 -nostdin"
+    "-reconnect_delay_max 5 -rw_timeout 15000000 -nostdin"
 )
 
-# ---------------------------------------------------------------------------
-# Cookie-free yt-dlp configuration
-# Multi-client strategy avoids the `web` client block on datacenter IPs.
-# ---------------------------------------------------------------------------
+# URL cache TTL: re-extract only if URL is older than this
+STREAM_URL_TTL = 300  # seconds
+
 YDL_OPTIONS = {
     "format": "bestaudio/best",
     "noplaylist": True,
@@ -78,21 +78,20 @@ YDL_OPTIONS = {
     },
     "extractor_args": {
         "youtube": {
-            "player_client": [
-                "android",
-                "ios",
-                "tv_embedded",
-                "web_safari",
-                "mweb",
-            ],
-            "skip": ["hls", "dash"],
+            "player_client": ["android", "ios", "web_safari"],
+            "skip": ["hls"],
         },
     },
 }
 
+# Autoplay uses ytsearch5 to pick a genuinely different result
+AUTOPLAY_OPTIONS = dict(YDL_OPTIONS)
+AUTOPLAY_OPTIONS["default_search"] = "ytsearch5:"
+
 players: dict[int, dict] = {}
 START_TIME = time.time()
 STATS = {"tracks_played": 0, "searches": 0}
+SYNC_HASH = "v2-fixed"  # bump to force re-sync of slash commands
 
 
 # ---------------------------------------------------------------------------
@@ -129,12 +128,12 @@ def get_player(guild_id):
             "lock": asyncio.Lock(),
             "suppress_end": False,
             "skip_requested": False,
+            "replay_current": False,   # NEW: replay / seek intent
+            "pending_seek": 0,         # NEW: seek offset for next playback
             "autoplay": False,
             "last_track": None,
             "history": deque(maxlen=25),
-            "seek_seconds": 0,
             "idle_since": time.time(),
-            "vote_skip": set(),
         }
     return players[guild_id]
 
@@ -157,20 +156,25 @@ async def safe_send(channel, **kwargs):
 # ---------------------------------------------------------------------------
 # yt-dlp wrappers
 # ---------------------------------------------------------------------------
-async def search_track(query, requester):
+async def search_track(query, requester, options=None, exclude_url=None):
     loop = asyncio.get_running_loop()
     STATS["searches"] += 1
+    opts = options or YDL_OPTIONS
 
     def extract():
-        with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(query, download=False)
         if info and "entries" in info:
-            info = next((e for e in info["entries"] if e), None)
+            entries = [e for e in info["entries"] if e]
+            if exclude_url:
+                entries = [e for e in entries if e.get("webpage_url") != exclude_url]
+            info = entries[0] if entries else None
         if not info or not info.get("url"):
             raise ValueError("No playable audio found.")
         return {
             "title": info.get("title", "Unknown title"),
             "url": info.get("url"),
+            "url_ts": time.time(),
             "webpage_url": info.get("webpage_url") or info.get("original_url") or query,
             "duration": info.get("duration"),
             "thumbnail": info.get("thumbnail"),
@@ -182,11 +186,14 @@ async def search_track(query, requester):
 
 
 async def refresh_stream_url(track):
+    # Use cached URL if it's still fresh
+    if track.get("url") and (time.time() - track.get("url_ts", 0)) < STREAM_URL_TTL:
+        return track["url"]
+
     loop = asyncio.get_running_loop()
 
     def extract():
-        opts = dict(YDL_OPTIONS)
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
             info = ydl.extract_info(track["webpage_url"], download=False)
         if info and "entries" in info:
             info = next((e for e in info["entries"] if e), None)
@@ -194,14 +201,30 @@ async def refresh_stream_url(track):
             raise ValueError("Source did not return a playable stream.")
         return info["url"]
 
-    return await loop.run_in_executor(None, extract)
+    url = await loop.run_in_executor(None, extract)
+    track["url"] = url
+    track["url_ts"] = time.time()
+    return url
 
 
-async def fetch_lyrics(query: str):
+def clean_title_for_lyrics(title: str) -> str:
+    """Strip common YouTube suffixes before searching lyrics."""
+    title = re.sub(
+        r"\s*[\(\[\{][^\)\]\}]*(official|lyrics?|video|audio|hd|hq|mv|m/v)[^\)\]\}]*[\)\]\}]",
+        "", title, flags=re.I,
+    )
+    title = re.sub(r"\s*-\s*(topic|vevo)\s*$", "", title, flags=re.I)
+    return title.strip()
+
+
+async def fetch_lyrics(title: str, artist: str = None):
     url = "https://lrclib.net/api/search"
+    params = {"q": clean_title_for_lyrics(title)}
+    if artist:
+        params["artist_name"] = artist
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.get(url, params={"q": query}, timeout=10) as r:
+            async with s.get(url, params=params, timeout=10) as r:
                 if r.status != 200:
                     return None
                 data = await r.json()
@@ -236,12 +259,14 @@ def dashboard_embed(guild):
     track = p["current"]
     if track:
         e = track_embed(track, "🎧 RAJ MUSIC PRO • LIVE PLAYER")
-        status = "⏸️ Paused" if guild.voice_client and guild.voice_client.is_paused() else "▶️ Active"
+        vc = guild.voice_client
+        status = "⏸️ Paused" if vc and vc.is_paused() else "▶️ Active"
         e.description += (
             f"\n\n**Playback**  {status}"
             f"  ·  **Volume** `{round(p['volume'] * 100)}%`"
             f"  ·  **Loop** `{p['loop'].title()}`"
-            f"\n**Up next:** `{len(p['queue'])}` track(s)"
+            f"\n**Autoplay**  `{'On' if p['autoplay'] else 'Off'}`"
+            f"  ·  **Up next:** `{len(p['queue'])}` track(s)"
         )
         return e
     return make_embed(
@@ -274,6 +299,15 @@ class MusicDashboard(discord.ui.View):
         else:
             await interaction.followup.send(message, embed=embed, ephemeral=True)
 
+    async def _refresh_embed(self, interaction):
+        """Re-render the dashboard embed after state changes."""
+        try:
+            await interaction.message.edit(
+                embed=dashboard_embed(interaction.guild), view=self
+            )
+        except discord.HTTPException:
+            log.debug("dashboard refresh failed", exc_info=True)
+
     @discord.ui.button(label="Pause", emoji="⏸️", style=discord.ButtonStyle.primary,
                        custom_id="rajmusic:pause_resume", row=0)
     async def pause_resume(self, interaction, button):
@@ -284,11 +318,13 @@ class MusicDashboard(discord.ui.View):
             vc.pause()
             button.label, button.emoji = "Resume", "▶️"
             await interaction.response.edit_message(view=self)
+            await self._refresh_embed(interaction)
             await interaction.followup.send("Playback paused.", ephemeral=True)
         elif vc.is_paused():
             vc.resume()
             button.label, button.emoji = "Pause", "⏸️"
             await interaction.response.edit_message(view=self)
+            await self._refresh_embed(interaction)
             await interaction.followup.send("Playback resumed.", ephemeral=True)
         else:
             await self._reply(interaction, "Nothing is currently playing.")
@@ -312,6 +348,8 @@ class MusicDashboard(discord.ui.View):
         vc = interaction.guild.voice_client
         if vc and (vc.is_playing() or vc.is_paused()):
             p["suppress_end"] = True
+            p["replay_current"] = False
+            p["pending_seek"] = 0
             vc.stop()
         p["current"] = None
         await self._reply(interaction, "Playback stopped and the queue was cleared.")
@@ -352,6 +390,7 @@ class MusicDashboard(discord.ui.View):
         p["loop"] = modes[(modes.index(p["loop"]) + 1) % len(modes)]
         button.label = f"Loop: {p['loop'].title()}"
         await interaction.response.edit_message(view=self)
+        await self._refresh_embed(interaction)
         await interaction.followup.send(
             f"Loop mode set to **{p['loop'].title()}**.", ephemeral=True
         )
@@ -373,6 +412,7 @@ class MusicDashboard(discord.ui.View):
         p["autoplay"] = not p.get("autoplay", False)
         button.label = f"Autoplay: {'On' if p['autoplay'] else 'Off'}"
         await interaction.response.edit_message(view=self)
+        await self._refresh_embed(interaction)
         await interaction.followup.send(
             f"Autoplay is now **{'enabled' if p['autoplay'] else 'disabled'}**.",
             ephemeral=True,
@@ -386,6 +426,7 @@ class MusicDashboard(discord.ui.View):
         if vc and isinstance(vc.source, discord.PCMVolumeTransformer):
             vc.source.volume = p["volume"]
         await self._reply(interaction, f"Volume set to **{level}%**.")
+        await self._refresh_embed(interaction)
 
 
 # ---------------------------------------------------------------------------
@@ -408,8 +449,13 @@ async def start_next(guild):
             if p["autoplay"] and p.get("last_track"):
                 prev = p["last_track"]
                 try:
-                    q = f"{prev.get('channel') or ''} {prev['title']}".strip()
-                    related = await search_track(q, "RAJ MUSIC PRO Autoplay")
+                    query = f"{prev.get('channel') or ''} {prev['title']}".strip()
+                    related = await search_track(
+                        query,
+                        "RAJ MUSIC PRO Autoplay",
+                        options=AUTOPLAY_OPTIONS,
+                        exclude_url=prev.get("webpage_url"),
+                    )
                     if related.get("webpage_url") != prev.get("webpage_url"):
                         p["queue"].append(related)
                 except Exception:
@@ -432,15 +478,14 @@ async def start_next(guild):
 
         track = p["queue"].popleft()
         p["current"] = track
+        seek_offset = p.get("pending_seek", 0)
+        p["pending_seek"] = 0
 
         try:
             fresh_url = await refresh_stream_url(track)
-            track["url"] = fresh_url
-            seek = p.get("seek_seconds", 0)
-            before = FFMPEG_BEFORE + (f" -ss {seek}" if seek > 0 else "")
+            before = FFMPEG_BEFORE + (f" -ss {seek_offset}" if seek_offset > 0 else "")
             audio = discord.FFmpegPCMAudio(fresh_url, before_options=before, options="-vn")
             source = discord.PCMVolumeTransformer(audio, volume=p["volume"])
-            p["seek_seconds"] = 0
 
             def after_play(error, _gid=guild.id, _t=track):
                 if error:
@@ -450,14 +495,16 @@ async def start_next(guild):
                 fut = asyncio.run_coroutine_threadsafe(
                     track_finished(_gid, _t, error), bot.loop
                 )
-                try:
-                    fut.result(timeout=30)
-                except Exception:
-                    log.exception("track_finished failed")
+                # Do NOT block the FFmpeg thread with .result()
+                fut.add_done_callback(
+                    lambda f: f.exception()
+                    and log.error("track_finished failed: %s", f.exception())
+                )
 
             vc.play(source, after=after_play)
             STATS["tracks_played"] += 1
             p["history"].appendleft(track)
+            p["idle_since"] = time.time()
 
             channel = get_text_channel(p)
             await safe_send(channel, embed=track_embed(track), view=MusicDashboard())
@@ -472,27 +519,29 @@ async def track_finished(guild_id, finished_track, error=None):
     p = get_player(guild_id)
 
     async with p["lock"]:
+        # Handle stop / replay / seek paths first
         if p["suppress_end"]:
             p["suppress_end"] = False
-            p["current"] = None
             p["skip_requested"] = False
-            return
+            replay = p.get("replay_current", False)
+            p["replay_current"] = False
+            p["current"] = None
+            if replay:
+                p["queue"].appendleft(finished_track)
+            # fall through to start_next
 
-        skipped = p["skip_requested"]
-        p["skip_requested"] = False
-
-        if p.get("current"):
-            p["last_track"] = p["current"]
         else:
+            skipped = p["skip_requested"]
+            p["skip_requested"] = False
+
             p["last_track"] = finished_track
 
-        if not skipped and p["loop"] == "song" and p["current"] is finished_track:
-            p["queue"].appendleft(finished_track)
-        elif p["loop"] == "queue" and not skipped:
-            p["queue"].append(finished_track)
+            if not skipped and p["loop"] == "song":
+                p["queue"].appendleft(finished_track)
+            elif not skipped and p["loop"] == "queue":
+                p["queue"].append(finished_track)
 
-        p["current"] = None
-        p["vote_skip"] = set()
+            p["current"] = None
 
     if error:
         channel = get_text_channel(p)
@@ -500,7 +549,8 @@ async def track_finished(guild_id, finished_track, error=None):
             channel,
             embed=make_embed(
                 "⚠️ Playback Error",
-                "The previous track encountered an error. Trying the next queued track.",
+                f"**{finished_track.get('title', 'Unknown track')}** failed.\n"
+                "Trying the next queued track.",
                 RED,
             ),
         )
@@ -554,17 +604,19 @@ async def on_ready():
         bot.add_view(MusicDashboard())
         bot._music_view_registered = True
 
-    try:
-        if GUILD_ID.isdigit():
-            guild = discord.Object(id=int(GUILD_ID))
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
-            log.info("Synced %s commands to guild %s", len(synced), GUILD_ID)
-        else:
-            synced = await bot.tree.sync()
-            log.info("Synced %s global commands", len(synced))
-    except Exception:
-        log.exception("Slash command sync failed")
+    if getattr(bot, "_sync_hash", None) != SYNC_HASH:
+        try:
+            if GUILD_ID.isdigit():
+                guild = discord.Object(id=int(GUILD_ID))
+                bot.tree.copy_global_to(guild=guild)
+                synced = await bot.tree.sync(guild=guild)
+                log.info("Synced %s commands to guild %s", len(synced), GUILD_ID)
+            else:
+                synced = await bot.tree.sync()
+                log.info("Synced %s global commands", len(synced))
+            bot._sync_hash = SYNC_HASH
+        except Exception:
+            log.exception("Slash command sync failed")
 
     if not idle_watcher.is_running():
         idle_watcher.start()
@@ -585,6 +637,8 @@ async def on_voice_state_update(member, before, after):
             p["queue"].clear()
             p["suppress_end"] = True
             p["skip_requested"] = False
+            p["replay_current"] = False
+            p["pending_seek"] = 0
             p["last_track"] = None
 
 
@@ -717,6 +771,8 @@ async def stop(interaction):
     vc = interaction.guild.voice_client
     if vc and (vc.is_playing() or vc.is_paused()):
         p["suppress_end"] = True
+        p["replay_current"] = False
+        p["pending_seek"] = 0
         vc.stop()
     else:
         p["current"] = None
@@ -734,6 +790,8 @@ async def leave(interaction):
     vc = interaction.guild.voice_client
     if vc:
         p["suppress_end"] = True
+        p["replay_current"] = False
+        p["pending_seek"] = 0
         await vc.disconnect(force=True)
         p["current"] = None
         return await interaction.response.send_message(
@@ -753,7 +811,8 @@ async def replay(interaction):
     vc = interaction.guild.voice_client
     if not vc:
         return await interaction.response.send_message("Not connected.", ephemeral=True)
-    p["seek_seconds"] = 0
+    p["pending_seek"] = 0
+    p["replay_current"] = True
     p["suppress_end"] = True
     vc.stop()
     await interaction.response.send_message(
@@ -790,7 +849,8 @@ async def seek(interaction, seconds: app_commands.Range[int, 0, 36000]):
     vc = interaction.guild.voice_client
     if not vc or not (vc.is_playing() or vc.is_paused()):
         return await interaction.response.send_message("Nothing is playing.", ephemeral=True)
-    p["seek_seconds"] = int(seconds)
+    p["pending_seek"] = int(seconds)
+    p["replay_current"] = True   # <- key: re-queue current track
     p["suppress_end"] = True
     vc.stop()
     await interaction.response.send_message(
@@ -890,6 +950,7 @@ async def move_cmd(
     await interaction.response.send_message(
         embed=make_embed("📋 Reordered", f"Moved **{track['title']}** to position **{dst}**.")
     )
+
 
 @bot.tree.command(name="skipto", description="Skip ahead to a queue position")
 @app_commands.describe(position="Position in the queue (1 = next)")
@@ -1080,13 +1141,16 @@ async def lyrics(interaction, query: str = None):
     if not interaction.guild:
         return await interaction.response.send_message("Server only.", ephemeral=True)
     p = get_player(interaction.guild.id)
-    title = query or (p["current"]["title"] if p["current"] else None)
-    if not title:
+    if query:
+        title, artist = query, None
+    elif p["current"]:
+        title, artist = p["current"]["title"], p["current"].get("channel")
+    else:
         return await interaction.response.send_message(
             "Nothing is playing. Pass a song title.", ephemeral=True
         )
     await interaction.response.defer()
-    text = await fetch_lyrics(title)
+    text = await fetch_lyrics(title, artist)
     if not text:
         return await interaction.followup.send(
             embed=make_embed("🎤 Lyrics", f"No lyrics found for **{title}**.", YELLOW)
