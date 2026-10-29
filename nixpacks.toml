@@ -1,0 +1,5 @@
+[phases.setup]
+nixPkgs = ["python312", "ffmpeg", "libsodium"]
+
+[start]
+cmd = "python -u bot.py"
